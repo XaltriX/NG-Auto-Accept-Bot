@@ -1,32 +1,40 @@
 import os
 import logging
 import asyncio
+import psutil
 from datetime import datetime, timedelta
 from pyrogram import Client, filters, errors, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from motor.motor_asyncio import AsyncIOMotorClient
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-import shutil
+import json
+from collections import defaultdict
 
 # Logging setup
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# Bot Configuration
-BOT_TOKEN = "7318148378:AAFqQbfhIFeOwVTv6a6jmwSowH7dmMbI7IU"
+# ==================== CONFIGURATION ====================
+
+BOT_TOKEN = "8572583556:AAFeadR0wqigQKKTi3oLeWXyuNF6BxgsosI"
 API_ID = "27352735"
 API_HASH = "8c4512c1052a60e05b05522a2ea12e5e"
 DB_URI = "mongodb+srv://50duddubot518:50duddubot518@cluster0.momby1w.mongodb.net/?appName=Cluster0"
 OWNER_USERNAME = "NeonGhost"
 OWNER_ID = None
+ADMIN_IDS = []  # Add admin user IDs here like [123456789, 987654321]
 WELCOME_IMAGE = "https://te.legra.ph/file/c5b07f2679e49c58bfb1b.jpg"
 
 # Create directories
 os.makedirs("sessions", exist_ok=True)
 os.makedirs("data", exist_ok=True)
 
-# MongoDB Setup with connection pooling
+# ==================== MONGODB SETUP ====================
+
 try:
     mongo_client = AsyncIOMotorClient(
         DB_URI,
@@ -42,11 +50,21 @@ try:
     channels_col = db['channels']
     sessions_col = db['sessions']
     stats_col = db['stats']
-    approved_users_col = db['approved_users']  # NEW: Track approved users for broadcast
+    bot_users_col = db['bot_users']  # Track bot users for broadcast
+    
+    # Create indexes for better performance
+    async def create_indexes():
+        await users_col.create_index("user_id", unique=True)
+        await channels_col.create_index([("user_id", 1), ("chat_id", 1)])
+        await sessions_col.create_index("user_id", unique=True)
+        await bot_users_col.create_index("user_id", unique=True)
+        logger.info("✅ Database indexes created")
+        
 except Exception as e:
-    logger.error(f"MongoDB setup error: {e}")
+    logger.error(f"❌ MongoDB setup error: {e}")
 
-# Scheduler & Bot
+# ==================== GLOBAL VARIABLES ====================
+
 scheduler = AsyncIOScheduler()
 bot = Client("auto_approve_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, workdir="data")
 
@@ -54,93 +72,35 @@ bot = Client("auto_approve_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=AP
 user_clients = {}
 user_states = {}
 active_tasks = {}
-broadcast_states = {}  # NEW: For broadcast handling
+live_handlers = {}  # Track live handlers per channel
+stats_cache = {}  # Cache for statistics
+cache_timestamp = {}  # Cache expiry tracking
+
+# Performance tracking
+start_time = datetime.now()
+approval_counter = defaultdict(int)  # Track approvals per hour
+
+# ==================== RATE LIMITS ====================
+
+RATE_LIMITS = {
+    "free": {
+        "pending_delay": 1.0,  # 1 req/sec
+        "pending_batch": 50,
+        "daily_limit": 1000,
+        "max_channels": 3
+    },
+    "premium": {
+        "pending_delay": 0.1,  # 10 req/sec (SAFE MAX)
+        "pending_batch": 100,
+        "daily_limit": None,  # Unlimited
+        "max_channels": None  # Unlimited
+    }
+}
+
 # ==================== HELPER FUNCTIONS ====================
-# ==================== STATS HELPER FUNCTIONS ====================
 
-async def initialize_channel_stats(user_id, chat_id):
-    """Initialize stats for a channel if not exists"""
-    try:
-        ch = await channels_col.find_one({"user_id": user_id, "chat_id": chat_id})
-        if ch and "dm_stats" not in ch:
-            await channels_col.update_one(
-                {"user_id": user_id, "chat_id": chat_id},
-                {"$set": {
-                    "dm_stats": {
-                        "total_dm_sent": 0,
-                        "today_dm_sent": 0,
-                        "total_dm_failed": 0,
-                        "last_reset_date": datetime.now(),
-                        "success_rate": 0.0
-                    }
-                }}
-            )
-    except Exception as e:
-        logger.error(f"Error initializing stats: {e}")
-
-async def update_dm_stats(user_id, chat_id, success=True):
-    """Update DM statistics"""
-    try:
-        ch = await channels_col.find_one({"user_id": user_id, "chat_id": chat_id})
-        if not ch:
-            return
-        
-        # Initialize if not exists
-        if "dm_stats" not in ch:
-            await initialize_channel_stats(user_id, chat_id)
-            ch = await channels_col.find_one({"user_id": user_id, "chat_id": chat_id})
-        
-        stats = ch.get("dm_stats", {})
-        
-        # Check if we need to reset today's count
-        last_reset = stats.get("last_reset_date", datetime.now())
-        if (datetime.now() - last_reset).days >= 1:
-            stats["today_dm_sent"] = 0
-            stats["last_reset_date"] = datetime.now()
-        
-        # Update stats
-        if success:
-            stats["total_dm_sent"] = stats.get("total_dm_sent", 0) + 1
-            stats["today_dm_sent"] = stats.get("today_dm_sent", 0) + 1
-        else:
-            stats["total_dm_failed"] = stats.get("total_dm_failed", 0) + 1
-        
-        # Calculate success rate
-        total_attempts = stats.get("total_dm_sent", 0) + stats.get("total_dm_failed", 0)
-        if total_attempts > 0:
-            stats["success_rate"] = round((stats.get("total_dm_sent", 0) / total_attempts) * 100, 1)
-        
-        # Save to database
-        await channels_col.update_one(
-            {"user_id": user_id, "chat_id": chat_id},
-            {"$set": {"dm_stats": stats}}
-        )
-        
-    except Exception as e:
-        logger.error(f"Error updating stats: {e}")
-
-async def get_channel_stats(user_id, chat_id):
-    """Get formatted channel statistics"""
-    try:
-        ch = await channels_col.find_one({"user_id": user_id, "chat_id": chat_id})
-        if not ch or "dm_stats" not in ch:
-            return None
-        
-        stats = ch["dm_stats"]
-        last_reset = stats.get("last_reset_date", datetime.now())
-        hours_ago = int((datetime.now() - last_reset).seconds / 3600)
-        
-        return {
-            "total": stats.get("total_dm_sent", 0),
-            "today": stats.get("today_dm_sent", 0),
-            "failed": stats.get("total_dm_failed", 0),
-            "rate": stats.get("success_rate", 0.0),
-            "reset_hours": hours_ago
-        }
-    except Exception as e:
-        logger.error(f"Error getting stats: {e}")
-        return None
 async def is_owner(user_id):
+    """Check if user is owner"""
     global OWNER_ID
     if OWNER_ID is None:
         try:
@@ -150,13 +110,49 @@ async def is_owner(user_id):
             pass
     return user_id == OWNER_ID
 
+async def is_admin(user_id):
+    """Check if user is admin or owner"""
+    return await is_owner(user_id) or user_id in ADMIN_IDS
+
+async def ensure_admin_premium(user_id):
+    """Auto-premium for owner and admins"""
+    if await is_admin(user_id):
+        await users_col.update_one(
+            {"user_id": user_id},
+            {"$set": {
+                "is_premium": True,
+                "premium_expires": None  # Lifetime
+            }},
+            upsert=True
+        )
+        logger.info(f"✅ Auto-premium granted to admin {user_id}")
+
+async def track_bot_user(user_id, username, first_name):
+    """Track users who start the bot"""
+    try:
+        await bot_users_col.update_one(
+            {"user_id": user_id},
+            {"$set": {
+                "user_id": user_id,
+                "username": username,
+                "first_name": first_name,
+                "last_interaction": datetime.now(),
+                "started_bot": True
+            }},
+            upsert=True
+        )
+    except Exception as e:
+        logger.error(f"Error tracking bot user: {e}")
+
 async def get_user(user_id):
+    """Get user from database"""
     try:
         return await users_col.find_one({"user_id": user_id})
     except:
         return None
 
 async def create_user(user_id, username):
+    """Create new user"""
     try:
         user_data = {
             "user_id": user_id,
@@ -169,104 +165,66 @@ async def create_user(user_id, username):
             "created_at": datetime.now()
         }
         await users_col.insert_one(user_data)
+        
+        # Auto-premium for admins
+        await ensure_admin_premium(user_id)
+        
         return user_data
     except:
         return None
 
 async def get_user_channels(user_id):
+    """Get user's channels"""
     try:
         return await channels_col.find({"user_id": user_id}).to_list(None)
     except:
         return []
 
 async def can_add_channel(user_id):
+    """Check if user can add more channels"""
     try:
         user = await get_user(user_id)
-        if user and user["is_premium"]:
+        if user and (user["is_premium"] or await is_admin(user_id)):
             return True, None
+        
         count = await channels_col.count_documents({"user_id": user_id})
-        if count >= 3:
-            return False, "❌ Free users can add max 3 channels. Upgrade to Premium!"
+        max_channels = RATE_LIMITS["free"]["max_channels"]
+        
+        if count >= max_channels:
+            return False, f"❌ Free users can add max {max_channels} channels. Upgrade to Premium!"
         return True, None
     except:
         return False, "❌ Error checking channel limit"
 
 async def check_request_limit(user_id):
+    """Check if user can make more requests"""
     try:
         user = await get_user(user_id)
         if not user:
             return False, 0
+        
+        # Reset if new day
         if (datetime.now() - user["last_reset"]).days >= 1:
-            await users_col.update_one({"user_id": user_id}, {"$set": {"daily_requests": 0, "last_reset": datetime.now()}})
+            await users_col.update_one(
+                {"user_id": user_id},
+                {"$set": {"daily_requests": 0, "last_reset": datetime.now()}}
+            )
             user["daily_requests"] = 0
-        if user["is_premium"]:
+        
+        # Premium or admin = unlimited
+        if user["is_premium"] or await is_admin(user_id):
             return True, user["daily_requests"]
-        if user["daily_requests"] >= 1000:
+        
+        # Free user limit
+        limit = RATE_LIMITS["free"]["daily_limit"]
+        if user["daily_requests"] >= limit:
             return False, user["daily_requests"]
+        
         return True, user["daily_requests"]
     except:
         return False, 0
-
-# NEW: Save approved user data
-async def save_approved_user(user_id, chat_id, approved_user_id, username, first_name):
-    try:
-        await approved_users_col.update_one(
-            {"user_id": user_id, "chat_id": chat_id, "approved_user_id": approved_user_id},
-            {"$set": {
-                "user_id": user_id,
-                "chat_id": chat_id,
-                "approved_user_id": approved_user_id,
-                "username": username,
-                "first_name": first_name,
-                "approved_at": datetime.now()
-            }},
-            upsert=True
-        )
-    except Exception as e:
-        logger.error(f"Error saving approved user: {e}")
-
-# NEW: Get all approved users for broadcast
-async def get_approved_users(user_id, chat_id=None):
-    try:
-        query = {"user_id": user_id}
-        if chat_id:
-            query["chat_id"] = chat_id
-        return await approved_users_col.find(query).to_list(None)
-    except:
-        return []
-
-async def check_premium_expiry():
-    try:
-        expired_users = await users_col.find({"is_premium": True, "premium_expires": {"$lt": datetime.now(), "$ne": None}}).to_list(None)
-        for user in expired_users:
-            await users_col.update_one({"user_id": user["user_id"]}, {"$set": {"is_premium": False, "premium_expires": None}})
-            try:
-                await bot.send_message(user["user_id"], "❌ **Premium Expired!**\n\nContact @NeonGhost to renew!")
-            except:
-                pass
-    except:
-        pass
-
-async def send_premium_reminders():
-    try:
-        reminder_date = datetime.now() + timedelta(days=3)
-        users = await users_col.find({"is_premium": True, "premium_expires": {"$gte": datetime.now(), "$lte": reminder_date, "$ne": None}}).to_list(None)
-        for user in users:
-            days_left = (user["premium_expires"] - datetime.now()).days
-            try:
-                await bot.send_message(user["user_id"], f"⚠️ Premium expires in {days_left} days!\nContact @NeonGhost")
-            except:
-                pass
-    except:
-        pass
-
-async def reset_daily_limits():
-    try:
-        await users_col.update_many({}, {"$set": {"daily_requests": 0, "last_reset": datetime.now()}})
-    except:
-        pass
-
-# NEW: Session management functions
+    
+# ==================== SESSION MANAGEMENT ====================
 
 async def save_session(user_id, session_string, api_id, api_hash, phone):
     """Save session to database"""
@@ -279,11 +237,11 @@ async def save_session(user_id, session_string, api_id, api_hash, phone):
                 "api_hash": api_hash,
                 "phone": phone,
                 "connected_at": datetime.now(),
-                "updated_at": datetime.now()  # FIX: Added this
+                "updated_at": datetime.now()
             }},
             upsert=True
         )
-        logger.info(f"Session saved for user {user_id}")
+        logger.info(f"✅ Session saved for user {user_id}")
         return True
     except Exception as e:
         logger.error(f"Error saving session: {e}")
@@ -292,19 +250,26 @@ async def save_session(user_id, session_string, api_id, api_hash, phone):
 async def load_session(user_id):
     """Load session from database"""
     try:
-        session_data = await sessions_col.find_one({"user_id": user_id})
-        return session_data
+        return await sessions_col.find_one({"user_id": user_id})
     except Exception as e:
         logger.error(f"Error loading session: {e}")
         return None
 
 async def delete_user_session(user_id):
-    """Delete user session from database and files"""
+    """Delete user session"""
     try:
-        # Delete from database
-        await sessions_col.delete_one({"user_id": user_id})
+        # Stop all tasks for this user
+        tasks_to_remove = [key for key in active_tasks.keys() if key.startswith(f"{user_id}_")]
+        for task_key in tasks_to_remove:
+            active_tasks[task_key].cancel()
+            del active_tasks[task_key]
         
-        # Disconnect client if active
+        # Remove live handlers
+        handlers_to_remove = [key for key in live_handlers.keys() if key.startswith(f"{user_id}_")]
+        for handler_key in handlers_to_remove:
+            del live_handlers[handler_key]
+        
+        # Disconnect client
         if user_id in user_clients:
             try:
                 await user_clients[user_id].stop()
@@ -312,12 +277,10 @@ async def delete_user_session(user_id):
                 pass
             del user_clients[user_id]
         
-        # Delete session files
-        session_file = f"sessions/user_{user_id}.session"
-        if os.path.exists(session_file):
-            os.remove(session_file)
+        # Delete from database
+        await sessions_col.delete_one({"user_id": user_id})
         
-        logger.info(f"Session deleted for user {user_id}")
+        logger.info(f"✅ Session deleted for user {user_id}")
         return True
     except Exception as e:
         logger.error(f"Error deleting session: {e}")
@@ -326,13 +289,12 @@ async def delete_user_session(user_id):
 async def initialize_user_client(user_id):
     """Initialize user client from saved session"""
     try:
+        # Check if client already exists and is connected
         if user_id in user_clients:
-            # Check if client is still connected
             try:
                 await user_clients[user_id].get_me()
                 return user_clients[user_id]
             except:
-                # Client disconnected, remove it
                 del user_clients[user_id]
         
         session_data = await load_session(user_id)
@@ -350,40 +312,324 @@ async def initialize_user_client(user_id):
         
         await user_client.start()
         user_clients[user_id] = user_client
-        logger.info(f"Client initialized for user {user_id}")
+        logger.info(f"✅ Client initialized for user {user_id}")
         return user_client
         
     except Exception as e:
-        logger.error(f"Error initializing client for {user_id}: {e}")
+        logger.error(f"❌ Error initializing client for {user_id}: {e}")
         return None
+    
+# ==================== STATISTICS FUNCTIONS ====================
+
+async def get_system_stats():
+    """Get system resource usage"""
+    try:
+        cpu_percent = psutil.cpu_percent(interval=1)
+        ram = psutil.virtual_memory()
+        ram_percent = ram.percent
+        uptime = datetime.now() - start_time
+        
+        hours = int(uptime.total_seconds() // 3600)
+        minutes = int((uptime.total_seconds() % 3600) // 60)
+        seconds = int(uptime.total_seconds() % 60)
+        
+        return {
+            "cpu": cpu_percent,
+            "ram": ram_percent,
+            "uptime": f"{hours}h {minutes}m {seconds}s"
+        }
+    except:
+        return {"cpu": 0, "ram": 0, "uptime": "0h 0m 0s"}
+
+async def get_database_stats():
+    """Get database statistics"""
+    try:
+        stats = await db.command("dbStats")
+        return {
+            "size": round(stats.get("dataSize", 0) / (1024 * 1024), 2),  # MB
+            "collections": len(await db.list_collection_names()),
+            "documents": sum([
+                await users_col.count_documents({}),
+                await channels_col.count_documents({}),
+                await sessions_col.count_documents({}),
+                await bot_users_col.count_documents({})
+            ])
+        }
+    except Exception as e:
+        logger.error(f"Error getting DB stats: {e}")
+        return {"size": 0, "collections": 0, "documents": 0}
+
+async def get_cached_stats(force_refresh=False):
+    """Get statistics with caching (5 min cache)"""
+    cache_key = "admin_stats"
+    
+    # Check cache
+    if not force_refresh and cache_key in stats_cache:
+        if cache_key in cache_timestamp:
+            age = (datetime.now() - cache_timestamp[cache_key]).seconds
+            if age < 300:  # 5 minutes
+                return stats_cache[cache_key]
+    
+    # Fetch fresh stats
+    try:
+        total_users = await users_col.count_documents({})
+        premium_users = await users_col.count_documents({"is_premium": True})
+        total_channels = await channels_col.count_documents({})
+        active_channels = await channels_col.count_documents({"is_active": True})
+        live_enabled = await channels_col.count_documents({"live_mode": True})
+        bot_users = await bot_users_col.count_documents({})
+        
+        # Active users (last 24h)
+        yesterday = datetime.now() - timedelta(days=1)
+        active_users = await bot_users_col.count_documents({
+            "last_interaction": {"$gte": yesterday}
+        })
+        
+        # Total approvals
+        pipeline = [
+            {"$group": {"_id": None, "total": {"$sum": "$total_approved"}}}
+        ]
+        approval_result = await channels_col.aggregate(pipeline).to_list(1)
+        total_approvals = approval_result[0]["total"] if approval_result else 0
+        
+        # Today's approvals
+        today_pipeline = [
+            {"$group": {"_id": None, "total": {"$sum": "$daily_requests"}}}
+        ]
+        today_result = await users_col.aggregate(today_pipeline).to_list(1)
+        today_approvals = today_result[0]["total"] if today_result else 0
+        
+        # Database stats
+        db_stats = await get_database_stats()
+        
+        # System stats
+        sys_stats = await get_system_stats()
+        
+        stats = {
+            "total_users": total_users,
+            "active_users": active_users,
+            "premium_users": premium_users,
+            "premium_percentage": round((premium_users / total_users * 100), 1) if total_users > 0 else 0,
+            "bot_users": bot_users,
+            "total_channels": total_channels,
+            "active_channels": active_channels,
+            "live_enabled": live_enabled,
+            "total_approvals": total_approvals,
+            "today_approvals": today_approvals,
+            "db_size": db_stats["size"],
+            "db_collections": db_stats["collections"],
+            "db_documents": db_stats["documents"],
+            "cpu": sys_stats["cpu"],
+            "ram": sys_stats["ram"],
+            "uptime": sys_stats["uptime"],
+            "active_tasks": len(active_tasks),
+            "active_sessions": len(user_clients)
+        }
+        
+        # Cache it
+        stats_cache[cache_key] = stats
+        cache_timestamp[cache_key] = datetime.now()
+        
+        return stats
+        
+    except Exception as e:
+        logger.error(f"Error getting stats: {e}")
+        return None
+
+async def format_admin_stats(stats):
+    """Format statistics in beautiful UI"""
+    if not stats:
+        return "❌ Error loading statistics"
+    
+    text = (
+        f"╭────[ 📊 ʟɪᴠᴇ sᴛᴀᴛɪsᴛɪᴄs ] ────⍟\n"
+        f"│\n"
+        f"├──[ 👥 ᴜsᴇʀ ᴍᴇᴛʀɪᴄs ]\n"
+        f"│   ├⋟ ᴛᴏᴛᴀʟ ᴜsᴇʀs ⋟ {stats['total_users']:,}\n"
+        f"│   ├⋟ ʙᴏᴛ ᴜsᴇʀs ⋟ {stats['bot_users']:,}\n"
+        f"│   ├⋟ ᴀᴄᴛɪᴠᴇ (24ʜ) ⋟ {stats['active_users']:,}\n"
+        f"│   ├⋟ ᴘʀᴇᴍɪᴜᴍ ⋟ {stats['premium_users']:,} ({stats['premium_percentage']}%)\n"
+        f"│\n"
+        f"├──[ 📢 ᴄʜᴀɴɴᴇʟ ᴍᴇᴛʀɪᴄs ]\n"
+        f"│   ├⋟ ᴛᴏᴛᴀʟ ᴄʜᴀɴɴᴇʟs ⋟ {stats['total_channels']:,}\n"
+        f"│   ├⋟ ᴀᴄᴛɪᴠᴇ ⋟ {stats['active_channels']:,}\n"
+        f"│   ├⋟ ʟɪᴠᴇ ᴍᴏᴅᴇ ᴏɴ ⋟ {stats['live_enabled']:,}\n"
+        f"│   └⋟ ᴀᴠɢ/ᴜsᴇʀ ⋟ {round(stats['total_channels'] / stats['total_users'], 1) if stats['total_users'] > 0 else 0}\n"
+        f"│\n"
+        f"├──[ ✅ ᴀᴘᴘʀᴏᴠᴀʟ ᴍᴇᴛʀɪᴄs ]\n"
+        f"│   ├⋟ ᴛᴏᴛᴀʟ ᴀᴘᴘʀᴏᴠᴇᴅ ⋟ {stats['total_approvals']:,}\n"
+        f"│   ├⋟ ᴛᴏᴅᴀʏ ⋟ {stats['today_approvals']:,}\n"
+        f"│   └⋟ ᴀᴠɢ/ᴅᴀʏ ⋟ {stats['today_approvals']:,}\n"
+        f"│\n"
+        f"├──[ 🗄️ ᴅᴀᴛᴀʙᴀsᴇ ɪɴꜰᴏ ]\n"
+        f"│   ├⋟ ᴅʙ ꜱɪᴢᴇ ⋟ {stats['db_size']:.2f} MB\n"
+        f"│   ├⋟ ᴄᴏʟʟᴇᴄᴛɪᴏɴꜱ ⋟ {stats['db_collections']}\n"
+        f"│   └⋟ ᴅᴏᴄᴜᴍᴇɴᴛꜱ ⋟ {stats['db_documents']:,}\n"
+        f"│\n"
+        f"├──[ 🤖 ʙᴏᴛ ʜᴇᴀʟᴛʜ ]\n"
+        f"│   ├⋟ ᴜᴘᴛɪᴍᴇ ⋟ {stats['uptime']}\n"
+        f"│   ├⋟ ʀᴀᴍ ᴜsᴀɢᴇ ⋟ {stats['ram']:.1f}%\n"
+        f"│   ├⋟ ᴄᴘᴜ ʟᴏᴀᴅ ⋟ {stats['cpu']:.1f}%\n"
+        f"│   ├⋟ ᴀᴄᴛɪᴠᴇ ᴛᴀsᴋs ⋟ {stats['active_tasks']}\n"
+        f"│   └⋟ sᴇssɪᴏɴs ⋟ {stats['active_sessions']}\n"
+        f"│\n"
+        f"╰─────────────────────⍟"
+    )
+    
+    return text
+# ==================== SCHEDULED TASKS ====================
+
+async def check_premium_expiry():
+    """Check and expire premium users"""
+    try:
+        expired_users = await users_col.find({
+            "is_premium": True,
+            "premium_expires": {"$lt": datetime.now(), "$ne": None}
+        }).to_list(None)
+        
+        for user in expired_users:
+            # Skip admins
+            if await is_admin(user["user_id"]):
+                continue
+            
+            await users_col.update_one(
+                {"user_id": user["user_id"]},
+                {"$set": {"is_premium": False, "premium_expires": None}}
+            )
+            
+            try:
+                await bot.send_message(
+                    user["user_id"],
+                    "❌ **Premium Expired!**\n\n"
+                    f"Contact @{OWNER_USERNAME} to renew!"
+                )
+            except:
+                pass
+                
+        if expired_users:
+            logger.info(f"✅ Expired {len(expired_users)} premium subscriptions")
+            
+    except Exception as e:
+        logger.error(f"Error checking premium expiry: {e}")
+
+async def send_premium_reminders():
+    """Send reminders 3 days before expiry"""
+    try:
+        reminder_date = datetime.now() + timedelta(days=3)
+        
+        users = await users_col.find({
+            "is_premium": True,
+            "premium_expires": {
+                "$gte": datetime.now(),
+                "$lte": reminder_date,
+                "$ne": None
+            }
+        }).to_list(None)
+        
+        for user in users:
+            days_left = (user["premium_expires"] - datetime.now()).days
+            try:
+                await bot.send_message(
+                    user["user_id"],
+                    f"⚠️ **Premium Expiring Soon!**\n\n"
+                    f"📅 {days_left} days left\n"
+                    f"Contact @{OWNER_USERNAME} to renew!"
+                )
+            except:
+                pass
+                
+    except Exception as e:
+        logger.error(f"Error sending reminders: {e}")
+
+async def reset_daily_limits():
+    """Reset daily request limits"""
+    try:
+        await users_col.update_many(
+            {},
+            {"$set": {"daily_requests": 0, "last_reset": datetime.now()}}
+        )
+        logger.info("✅ Daily limits reset")
+    except Exception as e:
+        logger.error(f"Error resetting limits: {e}")
+
+async def cleanup_inactive_sessions():
+    """Cleanup sessions inactive for 30+ days"""
+    try:
+        cutoff = datetime.now() - timedelta(days=30)
+        
+        inactive = await sessions_col.find({
+            "updated_at": {"$lt": cutoff}
+        }).to_list(None)
+        
+        for session in inactive:
+            await delete_user_session(session["user_id"])
+            
+        if inactive:
+            logger.info(f"✅ Cleaned up {len(inactive)} inactive sessions")
+            
+    except Exception as e:
+        logger.error(f"Error cleaning up sessions: {e}")
+
+async def memory_cleanup():
+    """Cleanup memory periodically"""
+    try:
+        # Remove disconnected clients
+        to_remove = []
+        for user_id, client in list(user_clients.items()):
+            try:
+                await client.get_me()
+            except:
+                to_remove.append(user_id)
+        
+        for user_id in to_remove:
+            del user_clients[user_id]
+            logger.info(f"✅ Removed disconnected client: {user_id}")
+        
+        # Clear old cache
+        for key in list(cache_timestamp.keys()):
+            age = (datetime.now() - cache_timestamp[key]).seconds
+            if age > 600:  # 10 minutes
+                if key in stats_cache:
+                    del stats_cache[key]
+                del cache_timestamp[key]
+        
+    except Exception as e:
+        logger.error(f"Error in memory cleanup: {e}")
+# ==================== START COMMAND ====================
 # ==================== START COMMAND ====================
 
 @bot.on_message(filters.command("start") & filters.private)
 async def start_command(client, message: Message):
     user_id = message.from_user.id
     username = message.from_user.username or message.from_user.first_name
+    first_name = message.from_user.first_name
     
+    # Track bot user
+    await track_bot_user(user_id, username, first_name)
+    
+    # Get or create user
     user = await get_user(user_id)
     if not user:
         await create_user(user_id, username)
         user = await get_user(user_id)
     
-    is_owner_user = await is_owner(user_id)
+    # Check if admin
+    is_admin_user = await is_admin(user_id)
     
     welcome_text = (
-        f"👋 **Welcome {message.from_user.first_name}!**\n\n"
+        f"👋 **Welcome {first_name}!**\n\n"
         f"🤖 **Auto-Approve Bot**\n"
         f"Automatically approve join requests!\n\n"
         f"✨ **Features:**\n"
         f"├ 🚀 Auto-approve (Pending + Live)\n"
         f"├ 📊 Real-time stats\n"
-        f"├ 💬 Custom welcomes\n"
-        f"├ 📈 Multi-channel\n"
-        f"└ 📢 Broadcast to approved users\n\n"
+        f"├ ⚡ Live mode toggle\n"
+        f"├ 📈 Multi-channel support\n"
+        f"└ 🔒 Safe & secure\n\n"
     )
     
-    if is_owner_user:
-        welcome_text += "👑 **You are the Owner!**"
+    if is_admin_user:
+        welcome_text += "👑 **You are Admin!** (Full Premium)"
     elif user:
         welcome_text += "💎 **Plan:** " + ("Premium ✨" if user["is_premium"] else "Free 🆓")
     
@@ -394,15 +640,22 @@ async def start_command(client, message: Message):
         [InlineKeyboardButton("🔄 Session Manager", callback_data="session_manager")],
     ]
     
-    if is_owner_user:
+    if is_admin_user:
         keyboard.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
     
     keyboard.append([InlineKeyboardButton("❓ Help", callback_data="help")])
     
     try:
-        await message.reply_photo(photo=WELCOME_IMAGE, caption=welcome_text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await message.reply_photo(
+            photo=WELCOME_IMAGE,
+            caption=welcome_text,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
     except:
-        await message.reply_text(welcome_text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await message.reply_text(
+            welcome_text,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
 # ==================== DASHBOARD ====================
 
@@ -416,12 +669,16 @@ async def dashboard_callback(client, callback_query):
         return
     
     channels_count = await channels_col.count_documents({"user_id": user_id})
-    approved_count = await approved_users_col.count_documents({"user_id": user_id})
+    active_count = await channels_col.count_documents({"user_id": user_id, "is_active": True})
     premium_status = "✅ Active" if user["is_premium"] else "❌ Inactive"
     
     if user["is_premium"] and user.get("premium_expires"):
         days_left = (user["premium_expires"] - datetime.now()).days
         premium_status += f"\n📅 {days_left} days left"
+    
+    is_admin_user = await is_admin(user_id)
+    if is_admin_user:
+        premium_status = "👑 Admin (Lifetime)"
     
     text = (
         f"📊 **Dashboard**\n\n"
@@ -430,13 +687,13 @@ async def dashboard_callback(client, callback_query):
         f"💎 Premium: {premium_status}\n\n"
         f"📈 **Stats:**\n"
         f"├ 📁 Channels: {channels_count}\n"
-        f"├ ✅ Approved Users: {approved_count}\n"
-        f"├ 📝 Today: {user['daily_requests']}/{'∞' if user['is_premium'] else '1000'}\n"
-        f"├ 📊 Total: {user['total_requests']}\n"
+        f"├ 🟢 Active: {active_count}\n"
+        f"├ 📝 Today: {user['daily_requests']:,}/{'∞' if user['is_premium'] or is_admin_user else '1,000'}\n"
+        f"├ 📊 Total: {user['total_requests']:,}\n"
         f"└ 📅 Since: {user['created_at'].strftime('%d %b %Y')}\n\n"
     )
     
-    if not user["is_premium"]:
+    if not user["is_premium"] and not is_admin_user:
         text += "⚠️ **Free Limits:**\n├ 🐢 1 req/sec\n├ 📊 1000/day\n└ 📁 3 channels\n\n💎 Upgrade Premium!"
     
     keyboard = [
@@ -449,6 +706,7 @@ async def dashboard_callback(client, callback_query):
     except errors.MessageNotModified:
         pass
     await callback_query.answer()
+
 # ==================== SESSION MANAGER ====================
 
 @bot.on_callback_query(filters.regex("^session_manager$"))
@@ -463,7 +721,6 @@ async def session_manager_callback(client, callback_query):
             [InlineKeyboardButton("🏠 Menu", callback_data="main_menu")]
         ]
     else:
-        # FIX: Check if updated_at exists
         updated_date = session_data.get('updated_at') or session_data.get('connected_at') or datetime.now()
         
         text = (
@@ -497,13 +754,6 @@ async def delete_session_confirm_callback(client, callback_query):
 async def delete_session_yes_callback(client, callback_query):
     user_id = callback_query.from_user.id
     
-    # Stop all active tasks
-    tasks_to_remove = [key for key in active_tasks.keys() if key.startswith(f"{user_id}_")]
-    for task_key in tasks_to_remove:
-        active_tasks[task_key].cancel()
-        del active_tasks[task_key]
-    
-    # Delete session
     success = await delete_user_session(user_id)
     
     if success:
@@ -519,6 +769,11 @@ async def delete_session_yes_callback(client, callback_query):
     await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     await callback_query.answer()
 
+@bot.on_callback_query(filters.regex("^main_menu$"))
+async def main_menu_callback(client, callback_query):
+    await callback_query.message.delete()
+    # Create a fake message object to reuse start_command
+    await start_command(client, callback_query.message)
 # ==================== CONNECT ACCOUNT ====================
 
 @bot.on_callback_query(filters.regex("^connect_account$"))
@@ -566,7 +821,6 @@ async def connect_command(client, message: Message):
         await message.delete()
         status_msg = await message.reply_text("⏳ Connecting...")
         
-        # Use in-memory session
         user_client = Client(
             f"user_{user_id}",
             api_id=int(api_id),
@@ -632,21 +886,6 @@ async def code_command(client, message: Message):
             session_string = await user_client.export_session_string()
             await save_session(user_id, session_string, user_data["api_id"], user_data["api_hash"], user_data["phone"])
             
-            # Save to database
-            await sessions_col.update_one(
-                {"user_id": user_id},
-                {"$set": {
-                    "api_id": user_data["api_id"],
-                    "api_hash": user_data["api_hash"],
-                    "phone": user_data["phone"],
-                    "session_string": session_string,
-                    "connected_at": datetime.now(),
-                    "account_name": me.first_name,
-                    "account_username": me.username
-                }},
-                upsert=True
-            )
-            
             user_clients[user_id] = user_client
             del user_states[user_id]
             
@@ -700,20 +939,6 @@ async def password_command(client, message: Message):
             session_string = await user_client.export_session_string()
             await save_session(user_id, session_string, user_data["api_id"], user_data["api_hash"], user_data["phone"])
             
-            await sessions_col.update_one(
-                {"user_id": user_id},
-                {"$set": {
-                    "api_id": user_data["api_id"],
-                    "api_hash": user_data["api_hash"],
-                    "phone": user_data["phone"],
-                    "session_string": session_string,
-                    "connected_at": datetime.now(),
-                    "account_name": me.first_name,
-                    "account_username": me.username
-                }},
-                upsert=True
-            )
-            
             user_clients[user_id] = user_client
             del user_states[user_id]
             
@@ -755,7 +980,6 @@ async def add_channel_guide_callback(client, callback_query):
     await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="my_channels")]]))
     await callback_query.answer()
 
-
 async def add_channel_process(client, message: Message):
     user_id = message.from_user.id
     channel_input = message.text.strip()
@@ -771,9 +995,9 @@ async def add_channel_process(client, message: Message):
             return
 
         chat = None
-
-        # Clean input
         original_input = channel_input
+        
+        # Clean input
         if "t.me/" in channel_input:
             channel_input = channel_input.split("t.me/")[-1].strip()
         if channel_input.startswith("@"):
@@ -921,18 +1145,15 @@ async def add_channel_process(client, message: Message):
                 "invite_link": invite_link,
                 "is_active": False,
                 "auto_approve_enabled": False,
+                "live_mode": False,  # NEW: Live mode toggle
                 "welcome_message": None,
                 "total_approved": 0,
+                "today_approved": 0,
                 "total_declined": 0,
+                "last_activity": "Never",
                 "added_at": datetime.now()
             }},
             upsert=True
-        )
-
-        # 👉 Your requested line (correct position)
-        await channels_col.update_one(
-            {"chat_id": chat.id},
-            {"$set": {"forward_type": "normal"}}
         )
 
         # Cleanup state
@@ -966,7 +1187,6 @@ async def add_channel_process(client, message: Message):
         if user_id in user_states:
             del user_states[user_id]
 
-
 # ==================== MY CHANNELS ====================
 
 @bot.on_callback_query(filters.regex("^my_channels$"))
@@ -985,7 +1205,8 @@ async def my_channels_callback(client, callback_query):
         keyboard = []
         for idx, ch in enumerate(channels, 1):
             status = "🟢" if ch.get("is_active") else "🔴"
-            text += f"{idx}. {status} {ch['title']}\n"
+            live_icon = "⚡" if ch.get("live_mode") else ""
+            text += f"{idx}. {status}{live_icon} {ch['title']}\n"
             keyboard.append([InlineKeyboardButton(f"📢 {ch['title'][:20]}", callback_data=f"channel_info_{ch['chat_id']}")])
         keyboard.append([InlineKeyboardButton("➕ Add", callback_data="add_channel_guide")])
         keyboard.append([InlineKeyboardButton("🏠 Menu", callback_data="main_menu")])
@@ -1009,32 +1230,38 @@ async def channel_info_callback(client, callback_query):
         return
     
     status = "🟢 Active" if ch.get("is_active") else "🔴 Inactive"
-    approved_count = await approved_users_col.count_documents({"user_id": user_id, "chat_id": chat_id})
+    live_status = "✅ ON" if ch.get("live_mode") else "❌ OFF"
     
-    # Simple formatted text
     text = (
-        f"╔══════════════════════════════╗\n"
-        f"║   📢 {ch['title'][:22]}\n"
-        f"╠══════════════════════════════╣\n"
-        f"║                              ║\n"
-        f"║  🆔 ID: `{chat_id}`\n"
-        f"║  📊 Status: {status}\n"
-        f"║                              ║\n"
-        f"╠══════════════════════════════╣\n"
-        f"║  📈 Approval Stats           ║\n"
-        f"║  ━━━━━━━━━━━━━━━━━━━━━━━    ║\n"
-        f"║  ✅ Total Approved: {ch.get('total_approved', 0):<8}║\n"
-        f"║  👥 Saved Users: {approved_count:<11}║\n"
-        f"║                              ║\n"
-        f"╚══════════════════════════════╝\n\n"
-        f"🔗 {ch['invite_link']}\n\n"
-        f"⚠️ **Safe Mode:** No welcome messages\n"
-        f"(Prevents account freeze)"
+        f"╭────[ 📢 ᴄʜᴀɴɴᴇʟ ᴅᴀsʜʙᴏᴀʀᴅ ] ────⍟\n"
+        f"│\n"
+        f"│  📺 {ch['title']}\n"
+        f"│  🆔 `{chat_id}`\n"
+        f"│\n"
+        f"├──[ ⚙️ sᴇᴛᴛɪɴɢs ]\n"
+        f"│   ├⋟ sᴛᴀᴛᴜs ⋟ {status}\n"
+        f"│   ├⋟ ᴀᴜᴛᴏ-ᴀᴘᴘʀᴏᴠᴇ ⋟ {'✅ ᴇɴᴀʙʟᴇᴅ' if ch.get('auto_approve_enabled') else '❌ ᴅɪsᴀʙʟᴇᴅ'}\n"
+        f"│   └⋟ ʟɪᴠᴇ ᴍᴏᴅᴇ ⋟ {live_status}\n"
+        f"│\n"
+        f"├──[ 📊 sᴛᴀᴛɪsᴛɪᴄs ]\n"
+        f"│   ├⋟ ᴛᴏᴛᴀʟ ᴀᴘᴘʀᴏᴠᴇᴅ ⋟ {ch.get('total_approved', 0):,}\n"
+        f"│   ├⋟ ᴛᴏᴅᴀʏ ⋟ {ch.get('today_approved', 0):,}\n"
+        f"│   └⋟ ʟᴀsᴛ ᴀᴄᴛɪᴠɪᴛʏ ⋟ {ch.get('last_activity', 'N/A')}\n"
+        f"│\n"
+        f"├──[ 🔗 ʟɪɴᴋ ]\n"
+        f"│   └⋟ {ch['invite_link']}\n"
+        f"│\n"
+        f"╰─────────────────────⍟\n\n"
+        f"⚠️ **Safe Mode:** No welcome messages"
     )
+    
+    # Dynamic button text
+    live_button_text = "🔴 Live: OFF" if ch.get("live_mode") else "🟢 Live: ON"
     
     keyboard = [
         [InlineKeyboardButton("▶️ Start", callback_data=f"start_approve_{chat_id}"), InlineKeyboardButton("⏸️ Stop", callback_data=f"stop_approve_{chat_id}")],
-        [InlineKeyboardButton("📢 Broadcast", callback_data=f"broadcast_channel_{chat_id}"), InlineKeyboardButton("🗑️ Remove", callback_data=f"remove_channel_{chat_id}")],
+        [InlineKeyboardButton(live_button_text, callback_data=f"toggle_live_{chat_id}")],
+        [InlineKeyboardButton("🗑️ Remove", callback_data=f"remove_channel_{chat_id}")],
         [InlineKeyboardButton("🔙 Back", callback_data="my_channels")]
     ]
     
@@ -1043,6 +1270,60 @@ async def channel_info_callback(client, callback_query):
     except errors.MessageNotModified:
         pass
     await callback_query.answer()
+
+# ==================== TOGGLE LIVE MODE ====================
+
+@bot.on_callback_query(filters.regex("^toggle_live_"))
+async def toggle_live_callback(client, callback_query):
+    user_id = callback_query.from_user.id
+    chat_id = int(callback_query.data.split("_")[2])
+    
+    ch = await channels_col.find_one({"user_id": user_id, "chat_id": chat_id})
+    if not ch:
+        await callback_query.answer("❌ Channel not found!", show_alert=True)
+        return
+    
+    # Toggle live mode
+    new_live_mode = not ch.get("live_mode", False)
+    
+    await channels_col.update_one(
+        {"user_id": user_id, "chat_id": chat_id},
+        {"$set": {"live_mode": new_live_mode}}
+    )
+    
+    if new_live_mode:
+        await callback_query.answer("✅ Live Mode Enabled! Requests will be approved instantly.", show_alert=True)
+    else:
+        await callback_query.answer("❌ Live Mode Disabled!", show_alert=True)
+    
+    # Refresh channel info
+    await channel_info_callback(client, callback_query)
+
+# ==================== REMOVE CHANNEL ====================
+
+@bot.on_callback_query(filters.regex("^remove_channel_"))
+async def remove_channel_callback(client, callback_query):
+    user_id = callback_query.from_user.id
+    chat_id = int(callback_query.data.split("_")[2])
+    
+    # Stop task if running
+    task_key = f"{user_id}_{chat_id}"
+    if task_key in active_tasks:
+        active_tasks[task_key].cancel()
+        del active_tasks[task_key]
+    
+    # Remove live handler
+    if task_key in live_handlers:
+        del live_handlers[task_key]
+    
+    # Remove channel
+    await channels_col.delete_one({"user_id": user_id, "chat_id": chat_id})
+    
+    await callback_query.answer("✅ Channel removed!")
+    await callback_query.message.edit_text(
+        "✅ **Channel Removed!**",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📁 My Channels", callback_data="my_channels")]])
+    )
 # ==================== AUTO-APPROVE SYSTEM ====================
 
 @bot.on_callback_query(filters.regex("^start_approve_"))
@@ -1071,7 +1352,7 @@ async def start_approve_callback(client, callback_query):
         active_tasks[task_key] = task
     
     await callback_query.message.edit_text(
-        f"✅ **Started!**\n\n📢 {ch['title']}\n🔄 Auto-approving pending + live requests...",
+        f"✅ **Started!**\n\n📢 {ch['title']}\n🔄 Auto-approving...",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏸️ Stop", callback_data=f"stop_approve_{chat_id}"), InlineKeyboardButton("🔙 Back", callback_data=f"channel_info_{chat_id}")]])
     )
     await callback_query.answer("✅ Started!")
@@ -1085,6 +1366,9 @@ async def stop_approve_callback(client, callback_query):
     if task_key in active_tasks:
         active_tasks[task_key].cancel()
         del active_tasks[task_key]
+    
+    if task_key in live_handlers:
+        del live_handlers[task_key]
     
     await channels_col.update_one(
         {"user_id": user_id, "chat_id": chat_id},
@@ -1101,359 +1385,119 @@ async def stop_approve_callback(client, callback_query):
     await callback_query.answer("⏸️ Stopped!")
 
 async def auto_approve_task(user_id, chat_id):
-    """Main auto-approve task - NO WELCOME MESSAGES (Safe from spam)"""
+    """Main auto-approve task"""
     try:
         user = await get_user(user_id)
         user_client = await initialize_user_client(user_id)
         
         if not user_client:
-            logger.error(f"Failed to initialize client for user {user_id}")
             return
         
         ch = await channels_col.find_one({"user_id": user_id, "chat_id": chat_id})
         if not ch:
             return
         
-        # Ensure chat is in cache
         try:
             chat = await user_client.get_chat(chat_id)
-            logger.info(f"Loaded chat into cache: {chat.title}")
         except Exception as e:
             logger.error(f"Cannot load chat {chat_id}: {e}")
             return
         
-        # Initialize stats
-        await initialize_channel_stats(user_id, chat_id)
+        is_premium_user = user["is_premium"] or await is_admin(user_id)
+        rate_config = RATE_LIMITS["premium"] if is_premium_user else RATE_LIMITS["free"]
+        delay = rate_config["pending_delay"]
+        batch_size = rate_config["pending_batch"]
         
-        delay = 1.0 if not user["is_premium"] else 0.2
+        logger.info(f"Started auto-approve for {user_id}_{chat_id} [Speed: {1/delay} req/s]")
         
-        logger.info(f"Started auto-approve for user {user_id}, channel {chat_id}")
+        # LIVE HANDLER
+        task_key = f"{user_id}_{chat_id}"
+        if task_key not in live_handlers:
+            @user_client.on_chat_join_request(filters.chat(chat_id))
+            async def handle_live_request(client, join_request):
+                try:
+                    ch_check = await channels_col.find_one({"user_id": user_id, "chat_id": chat_id})
+                    if not ch_check or not ch_check.get("live_mode", False):
+                        return
+                    
+                    await client.approve_chat_join_request(chat_id, join_request.from_user.id)
+                    asyncio.create_task(channels_col.update_one(
+                        {"user_id": user_id, "chat_id": chat_id},
+                        {"$inc": {"total_approved": 1, "today_approved": 1}, "$set": {"last_activity": datetime.now().strftime("%H:%M")}}
+                    ))
+                    logger.info(f"✅ Live approved: {join_request.from_user.id}")
+                except errors.FloodWait as e:
+                    await asyncio.sleep(e.value)
+                except Exception as e:
+                    logger.error(f"Live approval error: {e}")
+            
+            live_handlers[task_key] = handle_live_request
         
-        # Register handler for LIVE join requests
-        @user_client.on_chat_join_request(filters.chat(chat_id))
-        async def handle_live_request(client, join_request):
-            """Handle live join requests - APPROVE ONLY"""
-            try:
-                ch_check = await channels_col.find_one({"user_id": user_id, "chat_id": chat_id})
-                if not ch_check or not ch_check.get("is_active"):
-                    return
-                
-                can_approve, _ = await check_request_limit(user_id)
-                if not can_approve:
-                    return
-                
-                # ONLY APPROVE - NO WELCOME MESSAGE
-                await client.approve_chat_join_request(chat_id, join_request.from_user.id)
-                
-                # Update counters
-                await users_col.update_one(
-                    {"user_id": user_id},
-                    {"$inc": {"daily_requests": 1, "total_requests": 1}}
-                )
-                await channels_col.update_one(
-                    {"user_id": user_id, "chat_id": chat_id},
-                    {"$inc": {"total_approved": 1}}
-                )
-                
-                # Save user data (for broadcast)
-                await save_approved_user(
-                    user_id, chat_id,
-                    join_request.from_user.id,
-                    join_request.from_user.username,
-                    join_request.from_user.first_name
-                )
-                
-                logger.info(f"✅ Live approved: {join_request.from_user.id}")
-                
-            except errors.FloodWait as e:
-                await asyncio.sleep(e.value)
-            except Exception as e:
-                logger.error(f"Error in live approval: {e}")
-        
-        # Process PENDING requests
+        # PENDING LOOP
         while True:
             ch = await channels_col.find_one({"user_id": user_id, "chat_id": chat_id})
             if not ch or not ch.get("is_active"):
-                logger.info(f"Stopping task for {user_id}_{chat_id}")
                 break
             
             can_approve, _ = await check_request_limit(user_id)
             if not can_approve:
-                await bot.send_message(
-                    user_id,
-                    f"⚠️ **Daily Limit Reached!**\n\n📢 {ch['title']}\n\n💎 Upgrade Premium!"
-                )
+                await bot.send_message(user_id, f"⚠️ **Daily Limit Reached!**\n\n📢 {ch['title']}\n\n💎 Upgrade Premium!")
                 break
             
             try:
                 pending_count = 0
-                async for req in user_client.get_chat_join_requests(chat_id, limit=50):
+                async for req in user_client.get_chat_join_requests(chat_id, limit=batch_size):
                     try:
-                        # ONLY APPROVE - NO WELCOME MESSAGE
                         await user_client.approve_chat_join_request(chat_id, req.user.id)
                         pending_count += 1
                         
-                        # Update counters
-                        await users_col.update_one(
-                            {"user_id": user_id},
-                            {"$inc": {"daily_requests": 1, "total_requests": 1}}
-                        )
-                        await channels_col.update_one(
-                            {"user_id": user_id, "chat_id": chat_id},
-                            {"$inc": {"total_approved": 1}}
-                        )
-                        
-                        # Save user data (for broadcast)
-                        await save_approved_user(
-                            user_id, chat_id,
-                            req.user.id,
-                            req.user.username,
-                            req.user.first_name
-                        )
+                        if pending_count % 10 == 0:
+                            await users_col.update_one({"user_id": user_id}, {"$inc": {"daily_requests": 10, "total_requests": 10}})
+                            await channels_col.update_one({"user_id": user_id, "chat_id": chat_id}, {"$inc": {"total_approved": 10, "today_approved": 10}, "$set": {"last_activity": datetime.now().strftime("%H:%M")}})
                         
                         await asyncio.sleep(delay)
-                        
                     except errors.FloodWait as e:
-                        logger.warning(f"FloodWait: {e.value}s")
                         await asyncio.sleep(e.value)
                     except Exception as e:
-                        logger.error(f"Error approving request: {e}")
-                        continue
+                        logger.error(f"Approval error: {e}")
                 
                 if pending_count > 0:
-                    logger.info(f"✅ Approved {pending_count} pending requests in {chat_id}")
+                    remaining = pending_count % 10
+                    if remaining > 0:
+                        await users_col.update_one({"user_id": user_id}, {"$inc": {"daily_requests": remaining, "total_requests": remaining}})
+                        await channels_col.update_one({"user_id": user_id, "chat_id": chat_id}, {"$inc": {"total_approved": remaining, "today_approved": remaining}})
+                    logger.info(f"✅ Approved {pending_count} pending in {chat_id}")
                 
                 await asyncio.sleep(10)
-                
             except errors.ChatAdminRequired:
-                await bot.send_message(
-                    user_id,
-                    f"❌ **Admin Rights Lost!**\n\n📢 {ch['title']}\n\nMake sure you have admin rights."
-                )
+                await bot.send_message(user_id, f"❌ **Admin Rights Lost!**\n\n📢 {ch['title']}")
                 break
-            except errors.PeerIdInvalid:
-                logger.error(f"PeerIdInvalid for {chat_id}, reloading...")
-                try:
-                    await user_client.get_chat(chat_id)
-                    await asyncio.sleep(5)
-                except:
-                    break
             except Exception as e:
                 logger.error(f"Error in approval loop: {e}")
                 await asyncio.sleep(10)
-                
     except asyncio.CancelledError:
         logger.info(f"Task cancelled for {user_id}_{chat_id}")
     except Exception as e:
-        logger.error(f"Fatal error in auto_approve_task: {e}", exc_info=True)
-# ==================== WELCOME MESSAGE ====================
-
-@bot.on_callback_query(filters.regex("^remove_welcome_"))
-async def remove_welcome_callback(client, callback_query):
-    user_id = callback_query.from_user.id
-    chat_id = int(callback_query.data.split("_")[2])
-    
-    await channels_col.update_one(
-        {"user_id": user_id, "chat_id": chat_id},
-        {"$set": {"welcome_message": None}}
-    )
-    
-    if user_id in user_states:
-        del user_states[user_id]
-    
-    await callback_query.answer("✅ Welcome message removed!")
-    await callback_query.message.edit_text(
-        "✅ **Welcome Message Removed!**",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"channel_info_{chat_id}")]])
-    )
-
-@bot.on_callback_query(filters.regex("^remove_channel_"))
-async def remove_channel_callback(client, callback_query):
-    user_id = callback_query.from_user.id
-    chat_id = int(callback_query.data.split("_")[2])
-    
-    # Stop task if running
-    task_key = f"{user_id}_{chat_id}"
-    if task_key in active_tasks:
-        active_tasks[task_key].cancel()
-        del active_tasks[task_key]
-    
-    # Remove channel
-    await channels_col.delete_one({"user_id": user_id, "chat_id": chat_id})
-    
-    await callback_query.answer("✅ Channel removed!")
-    await callback_query.message.edit_text(
-        "✅ **Channel Removed!**",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📁 My Channels", callback_data="my_channels")]])
-    )
-# ==================== BROADCAST SYSTEM ====================
-
-@bot.on_callback_query(filters.regex("^broadcast_channel_"))
-async def broadcast_channel_callback(client, callback_query):
-    user_id = callback_query.from_user.id
-    chat_id = int(callback_query.data.split("_")[2])
-    
-    # Get approved users count
-    approved_count = await approved_users_col.count_documents({"user_id": user_id, "chat_id": chat_id})
-    
-    if approved_count == 0:
-        await callback_query.answer("❌ No approved users!", show_alert=True)
-        return
-    
-    text = (
-        f"📢 **Broadcast to Channel**\n\n"
-        f"👥 **Approved Users:** {approved_count}\n\n"
-        f"**How to broadcast:**\n"
-        f"1. Send or forward any message/media\n"
-        f"2. Reply to it with `/broadcast`\n"
-        f"3. Message will be posted **IN THE CHANNEL**\n\n"
-        f"⚠️ **Safe Mode:**\n"
-        f"├ No private DMs (prevents ban)\n"
-        f"├ Posted publicly in channel\n"
-        f"└ All members can see it\n\n"
-        f"💡 **Tip:** Use channel posts for announcements!"
-    )
-    
-    broadcast_states[user_id] = chat_id
-    
-    keyboard = [
-        [InlineKeyboardButton("❌ Cancel", callback_data=f"channel_info_{chat_id}")]
-    ]
-    
-    await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    await callback_query.answer()
-
-@bot.on_message(filters.command("broadcast") & filters.private)
-async def broadcast_command(client, message: Message):
-    user_id = message.from_user.id
-    
-    # Check if user is in broadcast state
-    if user_id not in broadcast_states:
-        await message.reply_text("❌ **Not in broadcast mode!**\n\nGo to channel info → Broadcast")
-        return
-    
-    # Check if replying to a message
-    if not message.reply_to_message:
-        await message.reply_text("❌ **Reply to a message to broadcast it!**")
-        return
-    
-    chat_id = broadcast_states[user_id]
-    ch = await channels_col.find_one({"user_id": user_id, "chat_id": chat_id})
-    
-    if not ch:
-        await message.reply_text("❌ Channel not found!")
-        del broadcast_states[user_id]
-        return
-    
-    # Initialize user client
-    user_client = await initialize_user_client(user_id)
-    if not user_client:
-        await message.reply_text("❌ Session lost! Reconnect your account.")
-        del broadcast_states[user_id]
-        return
-    
-    status_msg = await message.reply_text(f"📢 **Broadcasting to channel...**")
-    
-    try:
-        # Get the message to broadcast
-        broadcast_msg = message.reply_to_message
-        
-        # Post message IN THE CHANNEL (not private DMs)
-        if broadcast_msg.text:
-            sent = await user_client.send_message(
-                chat_id,
-                broadcast_msg.text
-            )
-        elif broadcast_msg.photo:
-            sent = await user_client.send_photo(
-                chat_id,
-                broadcast_msg.photo.file_id,
-                caption=broadcast_msg.caption
-            )
-        elif broadcast_msg.video:
-            sent = await user_client.send_video(
-                chat_id,
-                broadcast_msg.video.file_id,
-                caption=broadcast_msg.caption
-            )
-        elif broadcast_msg.document:
-            sent = await user_client.send_document(
-                chat_id,
-                broadcast_msg.document.file_id,
-                caption=broadcast_msg.caption
-            )
-        elif broadcast_msg.audio:
-            sent = await user_client.send_audio(
-                chat_id,
-                broadcast_msg.audio.file_id,
-                caption=broadcast_msg.caption
-            )
-        elif broadcast_msg.voice:
-            sent = await user_client.send_voice(
-                chat_id,
-                broadcast_msg.voice.file_id,
-                caption=broadcast_msg.caption
-            )
-        elif broadcast_msg.animation:
-            sent = await user_client.send_animation(
-                chat_id,
-                broadcast_msg.animation.file_id,
-                caption=broadcast_msg.caption
-            )
-        else:
-            # Try to copy message as is
-            sent = await user_client.copy_message(
-                chat_id,
-                message.chat.id,
-                broadcast_msg.id
-            )
-        
-        # Success
-        await status_msg.edit_text(
-            f"✅ **Broadcast Complete!**\n\n"
-            f"📢 Posted in: {ch['title']}\n"
-            f"🔗 Message Link: https://t.me/c/{str(chat_id)[4:]}/{sent.id}\n\n"
-            f"✨ **Safe Mode:** No private DMs sent"
-        )
-        
-        logger.info(f"Broadcast posted in channel {chat_id}")
-        
-    except errors.ChatWriteForbidden:
-        await status_msg.edit_text("❌ **No permission to post in channel!**\n\nMake sure you have send messages permission.")
-    except Exception as e:
-        await status_msg.edit_text(f"❌ **Broadcast Failed!**\n\nError: {str(e)}")
-        logger.error(f"Broadcast error: {e}")
-    
-    del broadcast_states[user_id]
+        logger.error(f"Fatal error: {e}", exc_info=True)
 # ==================== ADMIN PANEL ====================
 
 @bot.on_callback_query(filters.regex("^admin_panel$"))
 async def admin_panel_callback(client, callback_query):
-    if not await is_owner(callback_query.from_user.id):
-        await callback_query.answer("❌ Owner only!", show_alert=True)
+    if not await is_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ Admin only!", show_alert=True)
         return
     
-    total = await users_col.count_documents({})
-    premium = await users_col.count_documents({"is_premium": True})
-    channels = await channels_col.count_documents({})
-    active_channels = await channels_col.count_documents({"is_active": True})
-    total_approved = await approved_users_col.count_documents({})
+    stats = await get_cached_stats()
+    if not stats:
+        await callback_query.answer("❌ Error loading stats", show_alert=True)
+        return
     
-    text = (
-        f"👑 **Admin Panel**\n\n"
-        f"📊 **Statistics:**\n"
-        f"├ 👥 Total Users: {total}\n"
-        f"├ 💎 Premium: {premium}\n"
-        f"├ 📁 Channels: {channels}\n"
-        f"├ 🟢 Active: {active_channels}\n"
-        f"└ ✅ Approved Users: {total_approved}\n\n"
-        f"🔧 **Quick Actions:**"
-    )
+    text = await format_admin_stats(stats)
     
     keyboard = [
         [InlineKeyboardButton("➕ Add Premium", callback_data="admin_add_premium"), InlineKeyboardButton("➖ Remove Premium", callback_data="admin_remove_premium")],
-        [InlineKeyboardButton("📋 Premium List", callback_data="admin_premium_list"), InlineKeyboardButton("👥 All Users", callback_data="admin_all_users")],
-        [InlineKeyboardButton("📊 Stats", callback_data="admin_stats")],
+        [InlineKeyboardButton("📋 Premium List", callback_data="admin_premium_list"), InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data="admin_refresh")],
         [InlineKeyboardButton("🏠 Menu", callback_data="main_menu")]
     ]
     
@@ -1463,96 +1507,58 @@ async def admin_panel_callback(client, callback_query):
         pass
     await callback_query.answer()
 
-@bot.on_callback_query(filters.regex("^admin_stats$"))
-async def admin_stats_callback(client, callback_query):
-    if not await is_owner(callback_query.from_user.id):
+@bot.on_callback_query(filters.regex("^admin_refresh$"))
+async def admin_refresh_callback(client, callback_query):
+    if not await is_admin(callback_query.from_user.id):
         return
-    
-    # Aggregate stats
-    total_requests = await users_col.aggregate([
-        {"$group": {"_id": None, "total": {"$sum": "$total_requests"}}}
-    ]).to_list(1)
-    
-    total_req = total_requests[0]["total"] if total_requests else 0
-    
-    # Get top users
-    top_users = await users_col.find({}).sort("total_requests", -1).limit(5).to_list(5)
-    
-    text = f"📊 **Detailed Stats**\n\n"
-    text += f"📈 **Total Requests:** {total_req}\n\n"
-    text += f"🏆 **Top Users:**\n"
-    
-    for idx, u in enumerate(top_users, 1):
-        status = "💎" if u["is_premium"] else "🆓"
-        text += f"{idx}. {status} `{u['user_id']}` - {u['total_requests']} reqs\n"
-    
-    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]
-    
+    stats = await get_cached_stats(force_refresh=True)
+    text = await format_admin_stats(stats)
+    keyboard = [
+        [InlineKeyboardButton("➕ Add Premium", callback_data="admin_add_premium"), InlineKeyboardButton("➖ Remove Premium", callback_data="admin_remove_premium")],
+        [InlineKeyboardButton("📋 Premium List", callback_data="admin_premium_list"), InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data="admin_refresh")],
+        [InlineKeyboardButton("🏠 Menu", callback_data="main_menu")]
+    ]
     await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    await callback_query.answer()
+    await callback_query.answer("✅ Refreshed!")
 
 @bot.on_callback_query(filters.regex("^admin_add_premium$"))
 async def admin_add_premium_callback(client, callback_query):
-    if not await is_owner(callback_query.from_user.id):
+    if not await is_admin(callback_query.from_user.id):
         return
-    
     user_states[callback_query.from_user.id] = "admin_waiting_user_id"
-    
-    text = (
-        "➕ **Add Premium**\n\n"
-        "Send the User ID of the user you want to make premium.\n\n"
-        "**Example:** `123456789`"
-    )
-    
+    text = "➕ **Add Premium**\n\nSend User ID:\n\n**Example:** `123456789`"
     keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]]
-    
     await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     await callback_query.answer()
 
 async def admin_add_premium_handler(message: Message):
     user_id = message.from_user.id
-    
     try:
         target = int(message.text.strip())
         tuser = await get_user(target)
-        
         if not tuser:
-            await message.reply_text("❌ User not found! They must start the bot first.")
+            await message.reply_text("❌ User not found!")
             del user_states[user_id]
             return
-        
         user_states[user_id] = f"admin_duration_{target}"
-        
         keyboard = [
             [InlineKeyboardButton("7 Days", callback_data=f"premium_duration_7_{target}"), InlineKeyboardButton("30 Days", callback_data=f"premium_duration_30_{target}")],
-            [InlineKeyboardButton("90 Days", callback_data=f"premium_duration_90_{target}"), InlineKeyboardButton("365 Days", callback_data=f"premium_duration_365_{target}")],
-            [InlineKeyboardButton("♾️ Lifetime", callback_data=f"premium_duration_lifetime_{target}")],
+            [InlineKeyboardButton("90 Days", callback_data=f"premium_duration_90_{target}"), InlineKeyboardButton("♾️ Lifetime", callback_data=f"premium_duration_lifetime_{target}")],
             [InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]
         ]
-        
-        await message.reply_text(
-            f"👤 **User:** `{target}`\n"
-            f"📛 **Name:** {tuser.get('username', 'N/A')}\n\n"
-            f"⏱️ **Select Duration:**",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        
+        await message.reply_text(f"👤 User: `{target}`\n📛 {tuser.get('username', 'N/A')}\n\n⏱️ Select Duration:", reply_markup=InlineKeyboardMarkup(keyboard))
     except ValueError:
-        await message.reply_text("❌ Invalid User ID! Send numbers only.")
-        del user_states[user_id]
-    except Exception as e:
-        await message.reply_text(f"❌ Error: {str(e)}")
+        await message.reply_text("❌ Invalid User ID!")
         del user_states[user_id]
 
 @bot.on_callback_query(filters.regex("^premium_duration_"))
 async def premium_duration_callback(client, callback_query):
-    if not await is_owner(callback_query.from_user.id):
+    if not await is_admin(callback_query.from_user.id):
         return
-    
     parts = callback_query.data.split("_")
     duration = parts[2]
     target = int(parts[3])
-    
     if duration == "lifetime":
         expiry = None
         dur_text = "Lifetime"
@@ -1560,310 +1566,164 @@ async def premium_duration_callback(client, callback_query):
         days = int(duration)
         expiry = datetime.now() + timedelta(days=days)
         dur_text = f"{duration} days"
-    
-    await users_col.update_one(
-        {"user_id": target},
-        {"$set": {"is_premium": True, "premium_expires": expiry}}
-    )
-    
+    await users_col.update_one({"user_id": target}, {"$set": {"is_premium": True, "premium_expires": expiry}})
     try:
-        await bot.send_message(
-            target,
-            f"🎉 **Premium Activated!**\n\n"
-            f"⏱️ **Duration:** {dur_text}\n\n"
-            f"✨ **Benefits:**\n"
-            f"├ 🚀 5x faster approval\n"
-            f"├ ♾️ Unlimited requests\n"
-            f"└ 📁 Unlimited channels\n\n"
-            f"Enjoy your premium features!"
-        )
+        await bot.send_message(target, f"🎉 **Premium Activated!**\n\n⏱️ **Duration:** {dur_text}\n\n✨ Enjoy unlimited features!")
     except:
         pass
-    
     if callback_query.from_user.id in user_states:
         del user_states[callback_query.from_user.id]
-    
-    await callback_query.message.edit_text(
-        f"✅ **Premium Added!**\n\n"
-        f"👤 **User:** `{target}`\n"
-        f"⏱️ **Duration:** {dur_text}",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Admin Panel", callback_data="admin_panel")]])
-    )
-    await callback_query.answer("✅ Premium added!")
-
-@bot.on_callback_query(filters.regex("^admin_remove_premium$"))
-async def admin_remove_premium_callback(client, callback_query):
-    if not await is_owner(callback_query.from_user.id):
-        return
-    
-    user_states[callback_query.from_user.id] = "admin_remove_premium_id"
-    
-    text = (
-        "➖ **Remove Premium**\n\n"
-        "Send the User ID to remove premium.\n\n"
-        "**Example:** `123456789`"
-    )
-    
-    keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]]
-    
-    await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    await callback_query.answer()
-
-async def admin_remove_premium_handler(message: Message):
-    user_id = message.from_user.id
-    
-    try:
-        target = int(message.text.strip())
-        
-        await users_col.update_one(
-            {"user_id": target},
-            {"$set": {"is_premium": False, "premium_expires": None}}
-        )
-        
-        try:
-            await bot.send_message(
-                target,
-                "❌ **Premium Removed**\n\n"
-                "Your premium subscription has been removed.\n"
-                "Contact @NeonGhost for more info."
-            )
-        except:
-            pass
-        
-        await message.reply_text(
-            f"✅ **Premium Removed!**\n\n👤 User: `{target}`",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Admin Panel", callback_data="admin_panel")]])
-        )
-        
-        del user_states[user_id]
-        
-    except ValueError:
-        await message.reply_text("❌ Invalid User ID!")
-        del user_states[user_id]
-    except Exception as e:
-        await message.reply_text(f"❌ Error: {str(e)}")
-        del user_states[user_id]
+    await callback_query.message.edit_text(f"✅ **Premium Added!**\n\n👤 User: `{target}`\n⏱️ Duration: {dur_text}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Admin Panel", callback_data="admin_panel")]]))
+    await callback_query.answer("✅ Done!")
 
 @bot.on_callback_query(filters.regex("^admin_premium_list$"))
 async def admin_premium_list_callback(client, callback_query):
-    if not await is_owner(callback_query.from_user.id):
+    if not await is_admin(callback_query.from_user.id):
         return
-    
     pusers = await users_col.find({"is_premium": True}).to_list(None)
-    
     if not pusers:
         text = "📋 **Premium Users**\n\n❌ No premium users"
     else:
         text = f"📋 **Premium Users ({len(pusers)})**\n\n"
-        for idx, u in enumerate(pusers, 1):
+        for idx, u in enumerate(pusers[:20], 1):
             exp = u.get("premium_expires")
-            if exp:
-                days_left = (exp - datetime.now()).days
-                exp_text = f"{days_left}d left"
-            else:
-                exp_text = "Lifetime"
+            exp_text = f"{(exp - datetime.now()).days}d left" if exp else "Lifetime"
             text += f"{idx}. `{u['user_id']}` - {exp_text}\n"
-    
+        if len(pusers) > 20:
+            text += f"\n...and {len(pusers) - 20} more"
     keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]
-    
     await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     await callback_query.answer()
 
-@bot.on_callback_query(filters.regex("^admin_all_users$"))
-async def admin_all_users_callback(client, callback_query):
-    if not await is_owner(callback_query.from_user.id):
+@bot.on_callback_query(filters.regex("^admin_broadcast$"))
+async def admin_broadcast_callback(client, callback_query):
+    if not await is_admin(callback_query.from_user.id):
         return
-    
-    ausers = await users_col.find({}).sort("created_at", -1).limit(30).to_list(None)
-    
-    text = f"👥 **Recent Users (30)**\n\n"
-    for idx, u in enumerate(ausers, 1):
-        status = "💎" if u["is_premium"] else "🆓"
-        text += f"{idx}. {status} `{u['user_id']}` - {u['total_requests']} reqs\n"
-    
-    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]
-    
+    user_states[callback_query.from_user.id] = "admin_broadcast_message"
+    bot_users = await bot_users_col.count_documents({})
+    text = f"📢 **Broadcast Message**\n\n👥 Bot Users: {bot_users:,}\n\nSend your message to broadcast:"
+    keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]]
     await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     await callback_query.answer()
 
 async def admin_broadcast_handler(message: Message):
     user_id = message.from_user.id
     text = message.text
-    
     status = await message.reply_text("📢 **Broadcasting...**\n\n0 sent...")
-    
-    ausers = await users_col.find({}).to_list(None)
+    ausers = await bot_users_col.find({}).to_list(None)
     success = 0
     failed = 0
-    
     for idx, u in enumerate(ausers, 1):
         try:
             await bot.send_message(u["user_id"], text)
             success += 1
-            
             if success % 20 == 0:
                 await status.edit_text(f"📢 **Broadcasting...**\n\n✅ {success} sent...")
-            
             await asyncio.sleep(0.05)
         except:
             failed += 1
-    
-    await status.edit_text(
-        f"✅ **Broadcast Complete!**\n\n"
-        f"✅ Sent: {success}\n"
-        f"❌ Failed: {failed}\n"
-        f"📊 Total: {len(ausers)}"
-    )
-    
+    await status.edit_text(f"✅ **Broadcast Complete!**\n\n✅ Sent: {success}\n❌ Failed: {failed}\n📊 Total: {len(ausers)}")
     del user_states[user_id]
 # ==================== TEXT HANDLER ====================
 
-@bot.on_message(filters.text & filters.private & ~filters.command(["start", "connect", "code", "password", "broadcast"]))
+@bot.on_message(filters.text & filters.private & ~filters.command(["start", "connect", "code", "password"]))
 async def handle_text(client, message: Message):
     user_id = message.from_user.id
-    
     if user_id not in user_states:
         return
-    
-    # Handle dict states (waiting_code, waiting_2fa)
     if isinstance(user_states.get(user_id), dict):
-        state_value = user_states[user_id].get("state")
-        if state_value in ["waiting_code", "waiting_2fa"]:
-            return
-    
+        return
     state = user_states[user_id]
-    
-    # Handle string states
-    if isinstance(state, str):
-        if state == "waiting_channel":
-            await add_channel_process(client, message)
-        elif state == "admin_waiting_user_id":
-            await admin_add_premium_handler(message)
-        elif state == "admin_remove_premium_id":
-            await admin_remove_premium_handler(message)
-        elif state == "admin_broadcast_message":
-            await admin_broadcast_handler(message)
+    if state == "waiting_channel":
+        await add_channel_process(client, message)
+    elif state == "admin_waiting_user_id":
+        await admin_add_premium_handler(message)
+    elif state == "admin_broadcast_message":
+        await admin_broadcast_handler(message)
 
-# ==================== HELP & MENU ====================
-
-@bot.on_callback_query(filters.regex("^main_menu$"))
-async def main_menu_callback(client, callback_query):
-    await callback_query.message.delete()
-    await start_command(client, callback_query.message)
+# ==================== HELP ====================
 
 @bot.on_callback_query(filters.regex("^help$"))
 async def help_callback(client, callback_query):
     text = (
         "❓ **Help & Guide**\n\n"
         "**📱 Setup:**\n"
-        "1. Get API credentials from https://my.telegram.org\n"
+        "1. Get API from https://my.telegram.org\n"
         "2. Use `/connect API_ID API_HASH PHONE`\n"
-        "3. Enter OTP code with `/code`\n"
-        "4. Add your channels\n"
-        "5. Start auto-approve\n\n"
-        "**🔧 Features:**\n"
-        "├ Auto-approve pending requests\n"
-        "├ Auto-approve live requests\n"
-        "├ Custom welcome messages\n"
-        "├ Broadcast to approved users\n"
-        "└ Session management\n\n"
-        "**💬 Broadcast:**\n"
-        "1. Go to channel info\n"
-        "2. Click Broadcast\n"
-        "3. Reply to any message with `/broadcast`\n\n"
-        "**💎 Premium Benefits:**\n"
-        "├ 5x faster approval\n"
+        "3. Enter OTP with `/code`\n"
+        "4. Add channels\n"
+        "5. Toggle Live Mode for instant approval\n\n"
+        "**⚡ Live Mode:**\n"
+        "├ Unlimited instant approvals\n"
+        "├ No daily limit\n"
+        "└ Toggle per channel\n\n"
+        "**💎 Premium:**\n"
+        "├ 10 req/sec (pending)\n"
         "├ Unlimited requests\n"
-        "├ Unlimited channels\n"
-        "└ Priority support\n\n"
+        "└ Unlimited channels\n\n"
         "📞 **Support:** @NeonGhost"
     )
-    
     keyboard = [[InlineKeyboardButton("🏠 Menu", callback_data="main_menu")]]
-    
     await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     await callback_query.answer()
 
 # ==================== STARTUP & MAIN ====================
 
 async def restore_sessions():
-    """Restore user sessions on startup"""
     try:
         sessions = await sessions_col.find({}).to_list(None)
         logger.info(f"Found {len(sessions)} saved sessions")
-        
         for session in sessions:
             try:
                 user_id = session["user_id"]
-                user_client = Client(
-                    f"user_{user_id}",
-                    api_id=session["api_id"],
-                    api_hash=session["api_hash"],
-                    session_string=session["session_string"],
-                    in_memory=True
-                )
+                user_client = Client(f"user_{user_id}", api_id=session["api_id"], api_hash=session["api_hash"], session_string=session["session_string"], in_memory=True)
                 await user_client.start()
                 user_clients[user_id] = user_client
-                logger.info(f"Restored session for user {user_id}")
+                logger.info(f"Restored session for {user_id}")
             except Exception as e:
                 logger.error(f"Failed to restore session for {session['user_id']}: {e}")
-        
         logger.info(f"✅ Restored {len(user_clients)} sessions")
     except Exception as e:
         logger.error(f"Error restoring sessions: {e}")
 
 async def restore_active_tasks():
-    """Restore active auto-approve tasks on startup"""
     try:
         active_channels = await channels_col.find({"is_active": True}).to_list(None)
         logger.info(f"Found {len(active_channels)} active channels")
-        
         for ch in active_channels:
             user_id = ch["user_id"]
             chat_id = ch["chat_id"]
-            
-            # Check if user client exists
             if user_id in user_clients:
                 task_key = f"{user_id}_{chat_id}"
                 task = asyncio.create_task(auto_approve_task(user_id, chat_id))
                 active_tasks[task_key] = task
                 logger.info(f"Restored task for {task_key}")
-        
         logger.info(f"✅ Restored {len(active_tasks)} active tasks")
     except Exception as e:
         logger.error(f"Error restoring tasks: {e}")
 
-# Schedule jobs
 scheduler.add_job(check_premium_expiry, 'interval', hours=1)
 scheduler.add_job(send_premium_reminders, 'interval', hours=6)
 scheduler.add_job(reset_daily_limits, 'cron', hour=0, minute=0)
+scheduler.add_job(cleanup_inactive_sessions, 'cron', hour=3, minute=0)
+scheduler.add_job(memory_cleanup, 'interval', hours=2)
 
 async def main():
-    """Main function"""
     try:
-        # Test MongoDB connection
         await mongo_client.admin.command('ping')
         logger.info("✅ MongoDB connected!")
+        await create_indexes()
     except Exception as e:
         logger.error(f"❌ MongoDB connection failed: {e}")
         return
-    
-    # Start scheduler
     scheduler.start()
     logger.info("✅ Scheduler started")
-    
-    # Start bot
     await bot.start()
     me = await bot.get_me()
     logger.info(f"✅ Bot started: @{me.username}")
-    
-    # Restore sessions and tasks
     await restore_sessions()
     await restore_active_tasks()
-    
     logger.info("🚀 Bot is fully operational!")
-    
-    # Keep running
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
